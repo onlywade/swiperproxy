@@ -33,7 +33,7 @@ from BaseHTTPServer import BaseHTTPRequestHandler
 from SocketServer import ThreadingMixIn
 from ThreadPoolMixIn import ThreadPoolMixIn
 from BaseHTTPServer import HTTPServer
-import httplib
+import requests
 import traceback
 from Page import Page
 from JSPage import JSPage
@@ -90,8 +90,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         Handle the Location header in the headers, saving the new
         location in the response object.
         """
-        if resp.status >= 300 and resp.status <= 400:
-            location = resp.getheader('location', None)
+        if resp.status_code >= 300 and resp.status_code <= 400:
+            location = resp.headers.get('location', None)
             if location:
                 location = Util.rewrite_URL(location, self.server.config,
                                             self.is_ssl(), self.remote_host)
@@ -141,14 +141,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return it to the client. The 'post' boolean determines if this
         is a POST request and if so, the post data is read.
         """
-        self.referer = self.headers.getheader('referer')
-        self.user_agent = self.headers.getheader('user-agent')
-        client = self.headers.getheader('x-forwarded-for')
+        self.referer = self.headers.get('referer')
+        self.user_agent = self.headers.get('user-agent')
+        client = self.headers.get('x-forwarded-for')
         if client and self.server.config.use_forwarded_for:
             client = client.split(',')[-1].strip()
             self.client_address = (client, self.client_address[1])
         if self.handle_own() or self.handle_robot_block():
             return
+	if self.is_ssl():
+	    scheme = 'https://'
+	else:
+	    scheme = 'http://'
+	self.destination = scheme + '/'.join(self.path.split('/')[1:])
         self.remote_host = self.path.split('/')[1]
         self.path = '/' + '/'.join(self.path.split('/')[2:])
         self.server.reqs[threading.currentThread().name] = (self.remote_host,
@@ -173,7 +178,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         if post:
             # Read POST request itself, if not too long.
-            content_size = self.headers.getheader('content-length')
+            content_size = self.headers.get('content-length', None)
 
             if not content_size:
                 size = self.server.config.max_post_size
@@ -191,31 +196,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.data = self.rfile.read(size)
 
         try:
-            try:
-                # Create connection object, connect to upstream server
-                # and set the underlying socket's timeout
-                if self.is_ssl():
-                    c = httplib.HTTPSConnection(self.remote_host,
-                                                timeout=self.server.config.upstream_connect_timeout)
-                else:
-                    c = httplib.HTTPConnection(self.remote_host,
-                                               timeout=self.server.config.upstream_connect_timeout)
-                c.connect()
-                c.sock.settimeout(self.server.config.upstream_timeout)
-            except Exception, e:
-                # Unresolvable (or connect timeout?)
-                try:
-                    self.send_error(504, "Gateway timeout")
-                    self.my_log_request(504, 0)
-                    c.close()
-                except Exception, e:
-                    pass
-                return
-
-            if self.data:
-                method="POST"
-            else:
-                method="GET"
 
             req_headers = {}
             for k in  self.headers:
@@ -238,13 +218,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if self.server.config.gzip_server_response:
                 req_headers['Accept-Encoding']='gzip'
             req_headers['Connection'] = 'close'
-            req = c.request(method, self.path, self.data, req_headers)
-            resp = c.getresponse()
+
+            if self.data:
+                resp = requests.post(self.destination, data=data, headers=req_headers, stream=True)
+            else:
+                resp = requests.get(self.destination, headers=req_headers, stream=True)
+
+	    self.response_content = resp.raw
 
             # Handle redirects correctly.
             self.handle_redirect(resp)
 
-            content_type = resp.msg.gettype()
+            content_type = resp.headers.get('content-type', None)
+            if content_type:
+                content_type = content_type.split(';')[0]
 
             if content_type in ["text/html"]:
                 self.handle_rewritable(resp, Page)
@@ -304,32 +291,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
             pass
 
         return cookie
- 
+
     def handle_rewritable(self, resp, rewriter_class):
         """
         Handle HTML, JS and CSS pages.
         """
         self.resp = resp
         try:
-            self.content_length = int(resp.getheader('content-length', -1))
+            self.content_length = int(resp.headers.get('content-length', -1))
         except ValueError,e:
             self.content_length = -1
 
-        if resp.getheader('content-encoding') == 'gzip' \
-        or resp.getheader('transfer-encoding') == 'gzip':
+        if resp.headers.get('content-encoding') == 'gzip' \
+        or resp.headers.get('transfer-encoding') == 'gzip':
             self.gzip_from_server = True
         else:
             self.gzip_from_server = False
 
 
-        self.my_log_request(resp.status, self.content_length)
+        self.my_log_request(resp.status_code, self.content_length)
 
         # Write the response headers.
-        headerstr='HTTP/1.0 %d %s\r\n' % (resp.status, resp.reason)
+        headerstr='HTTP/1.0 %d %s\r\n' % (resp.status_code, resp.reason)
         headerstr+='Server: %s\r\n' % (self.server_version)
         headerstr+='Date: %s\r\n' % (self.date_time_string())
 
-        for (k, v) in resp.getheaders():
+        for k in resp.headers.keys():
+	    v = resp.headers[k]
             if k in ["server", "date", "content-length", "transfer-encoding",
                      "content-encoding", "connection"]:
                 continue
@@ -365,10 +353,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         decompresses if necessary.
         """
         if self.gzip_from_server:
-            s = self.resp.read(BLKSIZE)
+            s = self.response_content.read(BLKSIZE)
             return self.gzip_in.decompress(s)
         else:
-            return(self.resp.read(BLKSIZE))
+            return(self.response_content.read(BLKSIZE))
 
     def writer(self, string):
         """
@@ -384,10 +372,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
     def handle_content(self, resp):
-        headerstr='HTTP/1.0 %d %s\r\n' % (resp.status, resp.reason)
+        headerstr='HTTP/1.0 %d %s\r\n' % (resp.status_code, resp.reason)
         headerstr+='Server: %s\r\n' % (self.server_version)
         headerstr+='Date: %s\r\n' % (self.date_time_string())
-        for (k, v) in resp.getheaders():
+        for k in resp.headers.keys():
+	    v = resp.headers[k]
             if k in ["content-length", "server", "date", "content-encoding",
                      "transfer-encoding"]:
                 continue
@@ -399,19 +388,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             headerstr += "%s: %s\r\n" % (k, v)
 
         try:
-            content_length = int(resp.getheader('content-length', -1))
+            content_length = int(resp.headers.get('content-length', -1))
         except ValueError:
             content_length = -1
         cl = content_length
         if cl == -1:
             cl = 0
-        self.my_log_request(resp.status, cl)
+        self.my_log_request(resp.status_code, cl)
 
         if self.gzip_encoding:
             headerstr+="Content-Encoding: gzip\r\n"
 
-        if resp.getheader('content-encoding') == 'gzip' \
-        or resp.getheader('transfer-encoding') == 'gzip':
+        if resp.headers.get('content-encoding', None) == 'gzip' \
+        or resp.headers.get('transfer-encoding', None) == 'gzip':
             self.gzip_from_server = True
         else:
             self.gzip_from_server = False
@@ -425,7 +414,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         if self.gzip_encoding and self.gzip_from_server:
             # (1)
-            reader = self.resp.read
+            reader = self.response_content.read
             writer = self.wfile.write
             if content_length >= 0:
                 headerstr += "Content-Length: "+str(content_length)+"\r\n"
