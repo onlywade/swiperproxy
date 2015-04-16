@@ -111,6 +111,8 @@ def rewrite_URL(url, config, ssl, remote_host):
         newres[1] = config.hostname + ":" + str(port)
         if host == '':
             host = remote_host
+        if not newres[2].startswith('/'):
+            newres[2] = '/' + newres[2]
         newres[2] = endpoint + host + newres[2]
         url = urlparse.urlunsplit(newres)
     except Exception, e:
