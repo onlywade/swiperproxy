@@ -219,10 +219,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 req_headers['Accept-Encoding']='gzip'
             req_headers['Connection'] = 'close'
 
+	    proxy_dict = {}
+	    if self.server.config.upstream_proxy:
+		proxy_dict['http'] = self.server.config.upstream_proxy
+		proxy_dict['https'] = self.server.config.upstream_proxy
+
             if self.data:
-                resp = requests.post(self.destination, data=data, headers=req_headers, stream=True)
+                resp = requests.post(self.destination, data=self.data, headers=req_headers,
+			stream=True, proxies=proxy_dict, verify=False, allow_redirects=False)
             else:
-                resp = requests.get(self.destination, headers=req_headers, stream=True)
+                resp = requests.get(self.destination, headers=req_headers, stream=True,
+			proxies=proxy_dict, verify=False, allow_redirects=False)
 
 	    self.response_content = resp.raw
 
@@ -813,6 +820,7 @@ class Config:
         self.access_log = None
         self.error_log = None
         self.reverseproxy_scheme = 'http'
+        self.upstream_proxy = None
 
         (opts, rest) = getopt.getopt(sys.argv[1:], "c:")
 
@@ -886,6 +894,7 @@ class Config:
             self.access_log = conf.get('global', 'access_log')
             self.error_log = conf.get('global', 'error_log')
             self.reverseproxy_scheme = conf.get('global', 'reverseproxy_scheme')
+            self.upstream_proxy = conf.get('global', 'upstream_proxy')
 
         except Exception, e:
             print "Error while parsing configuration file:", e
